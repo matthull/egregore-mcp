@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "egregore-mcp"
+version = "0.1.0"
+description = "Unified MCP server for egregore tools"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.8.0",
+    "python-dotenv>=1.1.0",
+    "httpx>=0.28.0",
+]
+
+[tool.setuptools]
+py-modules = ["server"]
+
+[project.scripts]
+egregore-mcp = "server:main"
