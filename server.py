@@ -591,7 +591,12 @@ async def get_transcript(bot_id: str) -> str:
         if not formatted:
             return "Meeting is complete but the transcript is empty (no speech detected)."
 
-        return formatted
+        # Write to /tmp and return path (avoids bloating LLM context with full transcript)
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d-%H%M")
+        out_path = Path(f"/tmp/{timestamp}-meeting-{bot_id[:8]}.md")
+        out_path.write_text(formatted)
+        return f"Transcript saved to {out_path} ({len(segments)} segments, {len(formatted)} chars)"
 
     except ValueError as e:
         return str(e)
