@@ -188,8 +188,10 @@ def test_streaming_config_generation():
     assert "token=test-token-12345" in ep["url"]
     assert ep["events"] == ["transcript.data"]
     assert config["transcript"]["provider"]["recallai_streaming"]["mode"] == "prioritize_low_latency"
+    assert config["transcript"]["provider"]["recallai_streaming"]["language_code"] == "en"
     # Original config should be unchanged
     assert server.RECALLAI_RECORDING_CONFIG["transcript"]["provider"]["recallai_streaming"]["mode"] == "prioritize_accuracy"
+    assert server.RECALLAI_RECORDING_CONFIG["transcript"]["provider"]["recallai_streaming"]["language_code"] == "auto"
     print("  PASS: test_streaming_config_generation")
 
 

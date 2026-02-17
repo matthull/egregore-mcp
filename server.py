@@ -68,17 +68,28 @@ SLACK_WRITE_CHANNELS = [c.strip() for c in os.getenv("SLACK_WRITE_CHANNELS", "")
 SLACK_TAG_EMOJI = os.getenv("SLACK_TAG_EMOJI", "robot_face")
 SLACK_TAGGED_THREADS_FILE = Path(os.getenv("SLACK_TAGGED_THREADS_FILE", str(Path.home() / ".slack-tagged-threads.jsonl")))
 
-_slack_client: AsyncWebClient | None = None
+_slack_user_client: AsyncWebClient | None = None
+_slack_bot_client: AsyncWebClient | None = None
 
 
 def _get_slack_client() -> AsyncWebClient:
-    """Get or create the Slack API client (uses user token for full access)."""
-    global _slack_client
-    if _slack_client is None:
+    """Get or create the Slack user client (xoxp — for read/search operations)."""
+    global _slack_user_client
+    if _slack_user_client is None:
         if not SLACK_USER_TOKEN:
             raise ValueError("SLACK_USER_TOKEN not set. Add it to your .env file.")
-        _slack_client = AsyncWebClient(token=SLACK_USER_TOKEN)
-    return _slack_client
+        _slack_user_client = AsyncWebClient(token=SLACK_USER_TOKEN)
+    return _slack_user_client
+
+
+def _get_slack_bot_client() -> AsyncWebClient:
+    """Get or create the Slack bot client (xoxb — for posting messages as the bot)."""
+    global _slack_bot_client
+    if _slack_bot_client is None:
+        if not SLACK_BOT_TOKEN:
+            raise ValueError("SLACK_BOT_TOKEN not set. Add it to your .env file.")
+        _slack_bot_client = AsyncWebClient(token=SLACK_BOT_TOKEN)
+    return _slack_bot_client
 
 
 # Streaming configuration
@@ -260,6 +271,7 @@ def _build_streaming_config(session_id: str) -> dict:
 
     config = json.loads(json.dumps(RECALLAI_RECORDING_CONFIG))  # deep copy
     config["transcript"]["provider"]["recallai_streaming"]["mode"] = "prioritize_low_latency"
+    config["transcript"]["provider"]["recallai_streaming"]["language_code"] = "en"  # required for low latency mode
     config["realtime_endpoints"] = [
         {
             "type": "websocket",
@@ -850,7 +862,7 @@ async def reply_to_slack_thread(channel: str, thread_ts: str, text: str) -> str:
     if channel not in SLACK_WRITE_CHANNELS:
         return f"Channel {channel} is not in the write whitelist. Allowed channels: {SLACK_WRITE_CHANNELS}"
 
-    client = _get_slack_client()
+    client = _get_slack_bot_client()
     try:
         resp = await client.chat_postMessage(
             channel=channel,
