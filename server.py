@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import secrets
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -70,6 +71,7 @@ SLACK_TAGGED_THREADS_FILE = Path(os.getenv("SLACK_TAGGED_THREADS_FILE", str(Path
 
 _slack_user_client: AsyncWebClient | None = None
 _slack_bot_client: AsyncWebClient | None = None
+_slack_channel_cache: dict[str, str] = {}  # name -> ID and ID -> name
 
 
 def _get_slack_client() -> AsyncWebClient:
@@ -92,6 +94,83 @@ def _get_slack_bot_client() -> AsyncWebClient:
     return _slack_bot_client
 
 
+async def _resolve_slack_channel(channel: str) -> tuple[str, str | None]:
+    """Resolve a channel name or ID to (channel_id, channel_name).
+
+    Accepts '#channel-name', 'channel-name', or 'C...' IDs.
+    Returns (channel_id, channel_name) or (original_input, None) if unresolved.
+    """
+    channel = channel.strip().lstrip("#")
+
+    # Already an ID (starts with C or G and is alphanumeric)
+    if len(channel) > 5 and channel[0] in ("C", "G") and channel.isalnum():
+        if channel in _slack_channel_cache:
+            return channel, _slack_channel_cache[channel]
+        # Look up name from ID
+        try:
+            client = _get_slack_client()
+            resp = await client.conversations_info(channel=channel)
+            name = resp["channel"]["name"]
+            _slack_channel_cache[channel] = name
+            _slack_channel_cache[name] = channel
+            return channel, name
+        except SlackApiError:
+            return channel, None
+
+    # It's a name — check cache first
+    if channel in _slack_channel_cache:
+        cid = _slack_channel_cache[channel]
+        return cid, channel
+
+    # Search for channel by name via conversations_list
+    try:
+        client = _get_slack_client()
+        cursor = None
+        for _ in range(5):  # max 5 pages
+            kwargs: dict = {"types": "public_channel,private_channel", "limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = await client.conversations_list(**kwargs)
+            for ch in resp.get("channels", []):
+                _slack_channel_cache[ch["name"]] = ch["id"]
+                _slack_channel_cache[ch["id"]] = ch["name"]
+                if ch["name"] == channel:
+                    return ch["id"], ch["name"]
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+    except SlackApiError:
+        pass
+
+    # Fallback: search for a message in the channel to extract channel ID
+    # conversations_list doesn't always return all channels (Connect channels, etc.)
+    try:
+        client = _get_slack_client()
+        resp = await client.search_messages(query=f"in:#{channel}", count=1)
+        matches = resp.get("messages", {}).get("matches", [])
+        if matches:
+            ch_info = matches[0].get("channel", {})
+            cid = ch_info.get("id")
+            cname = ch_info.get("name")
+            if cid and cname:
+                _slack_channel_cache[cname] = cid
+                _slack_channel_cache[cid] = cname
+                return cid, cname
+    except SlackApiError:
+        pass
+
+    return channel, None
+
+
+async def _resolve_whitelist_names() -> list[str]:
+    """Return writable channel names (resolved from SLACK_WRITE_CHANNELS IDs)."""
+    names = []
+    for cid in SLACK_WRITE_CHANNELS:
+        _, name = await _resolve_slack_channel(cid)
+        names.append(f"#{name}" if name else cid)
+    return names
+
+
 # Streaming configuration
 EGREGORE_WS_PORT = int(os.getenv("EGREGORE_WS_PORT", "8765"))
 EGREGORE_WS_TOKEN = os.getenv("EGREGORE_WS_TOKEN", "") or secrets.token_urlsafe(32)
@@ -104,6 +183,36 @@ _stream_seq: dict[str, int] = {}  # session_id → next seq to assign
 _active_streams: dict[str, dict] = {}  # session_id → {bot_id, chunk_count, last_ts, jsonl_path}
 _session_to_bot: dict[str, str] = {}  # session_id → bot_id
 _bot_to_session: dict[str, str] = {}  # bot_id → session_id
+
+# Persistent stream state file — shared across MCP process instances
+_STREAM_STATE_PATH = ACTIVITY_DIR / ".stream-state.json"
+
+
+def _save_stream_state() -> None:
+    """Persist stream mappings to disk for cross-process access."""
+    state = {
+        "bot_to_session": _bot_to_session,
+        "session_to_bot": _session_to_bot,
+        "active_streams": _active_streams,
+        "stream_seq": _stream_seq,
+    }
+    _STREAM_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _STREAM_STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+def _load_stream_state() -> None:
+    """Load stream mappings from disk into module-level dicts."""
+    global _bot_to_session, _session_to_bot, _active_streams, _stream_seq
+    if not _STREAM_STATE_PATH.exists():
+        return
+    try:
+        state = json.loads(_STREAM_STATE_PATH.read_text())
+        _bot_to_session.update(state.get("bot_to_session", {}))
+        _session_to_bot.update(state.get("session_to_bot", {}))
+        _active_streams.update(state.get("active_streams", {}))
+        _stream_seq.update(state.get("stream_seq", {}))
+    except (json.JSONDecodeError, OSError):
+        pass  # Corrupted or locked — skip, in-memory state still works
 
 BOT_STATUS_MESSAGES = {
     "joining_call": "Bot is joining the meeting...",
@@ -150,6 +259,13 @@ def _format_transcript(segments: list[dict]) -> str:
 # --- WebSocket streaming helpers ---
 
 
+def _parse_ts(ts) -> datetime:
+    """Parse a timestamp that may be ISO string or Unix float."""
+    if isinstance(ts, str):
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+    return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
+
+
 def _get_jsonl_path(session_id: str, project: str = "") -> Path:
     """Get the JSONL file path for a streaming session."""
     effective_project = project or DEFAULT_PROJECT
@@ -190,6 +306,7 @@ async def _ws_handler(websocket: websockets.ServerConnection) -> None:
             "jsonl_path": str(jsonl_path),
         }
         _stream_seq[session_id] = 0
+        _save_stream_state()
         stream_info = _active_streams[session_id]
 
     jsonl_path = Path(stream_info["jsonl_path"])
@@ -427,7 +544,7 @@ async def session_log_read_recent(
 )
 async def observe_meeting(
     meeting_url: str,
-    bot_name: str = "EchoBot",
+    bot_name: str = "Echobot (Matt)",
     streaming: bool = False,
     project: str = "",
 ) -> str:
@@ -480,6 +597,7 @@ async def observe_meeting(
                 "last_ts": None,
                 "jsonl_path": str(jsonl_path),
             }
+            _save_stream_state()
             return (
                 f"Bot dispatched with live streaming. Bot ID: {bot_id}\n\n"
                 f"Streaming session: {session_id}\n"
@@ -519,6 +637,7 @@ async def check_bot(bot_id: str) -> str:
         result = f"Bot {bot_id}: {message}"
 
         # Append streaming status if applicable
+        _load_stream_state()
         session_id = _bot_to_session.get(bot_id)
         if session_id and session_id in _active_streams:
             info = _active_streams[session_id]
@@ -530,7 +649,7 @@ async def check_bot(bot_id: str) -> str:
             else:
                 ts_str = ""
                 if last_ts:
-                    dt = datetime.fromtimestamp(last_ts, tz=timezone.utc).astimezone()
+                    dt = _parse_ts(last_ts)
                     ts_str = f", last: {dt.strftime('%H:%M:%S')}"
                 result += f"\nStreaming: Active ({chunk_count} chunks received{ts_str})"
 
@@ -629,6 +748,9 @@ async def get_live_chunks(
         bot_id: The bot ID returned by observe_meeting (with streaming=True).
         project: Project name (default: EGREGORE_DEFAULT_PROJECT).
     """
+    # Load persisted state from disk (may have been set by another process)
+    _load_stream_state()
+
     # Resolve session_id from bot_id
     session_id = _bot_to_session.get(bot_id)
 
@@ -684,8 +806,7 @@ async def get_live_chunks(
     for chunk in new_chunks:
         ts = chunk.get("ts")
         if ts:
-            dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
-            time_str = dt.strftime("%H:%M:%S")
+            time_str = _parse_ts(ts).strftime("%H:%M:%S")
         else:
             time_str = "??:??:??"
         speaker = chunk.get("speaker", "Unknown")
@@ -696,8 +817,8 @@ async def get_live_chunks(
     first_ts = new_chunks[0].get("ts")
     last_ts = new_chunks[-1].get("ts")
     if first_ts and last_ts:
-        t1 = datetime.fromtimestamp(first_ts, tz=timezone.utc).astimezone().strftime("%H:%M:%S")
-        t2 = datetime.fromtimestamp(last_ts, tz=timezone.utc).astimezone().strftime("%H:%M:%S")
+        t1 = _parse_ts(first_ts).strftime("%H:%M:%S")
+        t2 = _parse_ts(last_ts).strftime("%H:%M:%S")
         summary = f"--- {len(new_chunks)} new chunks ({t1} – {t2}) ---"
     else:
         summary = f"--- {len(new_chunks)} new chunks ---"
@@ -808,12 +929,16 @@ async def read_slack_thread(channel: str, thread_ts: str) -> str:
     Returns a formatted conversation with author names, timestamps, and message text.
 
     Args:
-        channel: Slack channel ID (e.g. C0AEVCZN7JT).
+        channel: Channel name (e.g. '#agentic-pilot-ops') or channel ID (e.g. 'C0AEVCZN7JT').
         thread_ts: Thread timestamp (the ts of the parent message).
     """
+    channel_id, channel_name = await _resolve_slack_channel(channel)
+    if channel_name is None:
+        return f"Could not resolve channel '{channel}'. Check the name or ID."
+
     client = _get_slack_client()
     try:
-        resp = await client.conversations_replies(channel=channel, ts=thread_ts, limit=100)
+        resp = await client.conversations_replies(channel=channel_id, ts=thread_ts, limit=100)
         messages = resp.get("messages", [])
         if not messages:
             return "Thread not found or empty."
@@ -848,6 +973,47 @@ async def read_slack_thread(channel: str, thread_ts: str) -> str:
 
 @mcp.tool(
     annotations=ToolAnnotations(
+        title="Post to Slack",
+        readOnlyHint=False,
+        destructiveHint=False,
+        openWorldHint=True,
+    )
+)
+async def post_to_slack(channel: str, text: str) -> str:
+    """Post a new message to a Slack channel. Channel must be in the write whitelist.
+
+    Use this to start a new conversation (not reply to an existing thread).
+    Link unfurling is disabled for security (prevents data exfiltration via previews).
+
+    Args:
+        channel: Channel name (e.g. '#agentic-pilot-ops') or channel ID (e.g. 'C0AEVCZN7JT').
+        text: Message text to post.
+    """
+    channel_id, channel_name = await _resolve_slack_channel(channel)
+
+    if channel_name is None:
+        return f"Could not resolve channel '{channel}'. Check the name or ID."
+
+    if channel_id not in SLACK_WRITE_CHANNELS:
+        allowed = await _resolve_whitelist_names()
+        return f"#{channel_name} is not in the write whitelist. Allowed: {', '.join(allowed)}"
+
+    client = _get_slack_bot_client()
+    try:
+        resp = await client.chat_postMessage(
+            channel=channel_id,
+            text=text,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+        ts = resp.get("ts", "unknown")
+        return f"Message posted to #{channel_name} (ts: {ts})"
+    except SlackApiError as e:
+        return f"Slack API error: {e.response['error']}"
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
         title="Reply to Slack Thread",
         readOnlyHint=False,
         destructiveHint=False,
@@ -860,26 +1026,197 @@ async def reply_to_slack_thread(channel: str, thread_ts: str, text: str) -> str:
     Link unfurling is disabled for security (prevents data exfiltration via previews).
 
     Args:
-        channel: Slack channel ID.
+        channel: Channel name (e.g. '#agentic-pilot-ops') or channel ID (e.g. 'C0AEVCZN7JT').
         thread_ts: Thread timestamp to reply to.
         text: Message text to post.
     """
-    if channel not in SLACK_WRITE_CHANNELS:
-        return f"Channel {channel} is not in the write whitelist. Allowed channels: {SLACK_WRITE_CHANNELS}"
+    channel_id, channel_name = await _resolve_slack_channel(channel)
+
+    if channel_name is None:
+        return f"Could not resolve channel '{channel}'. Check the name or ID."
+
+    if channel_id not in SLACK_WRITE_CHANNELS:
+        allowed = await _resolve_whitelist_names()
+        return f"#{channel_name} is not in the write whitelist. Allowed: {', '.join(allowed)}"
 
     client = _get_slack_bot_client()
     try:
         resp = await client.chat_postMessage(
-            channel=channel,
+            channel=channel_id,
             thread_ts=thread_ts,
             text=text,
             unfurl_links=False,
             unfurl_media=False,
         )
         ts = resp.get("ts", "unknown")
-        return f"Reply posted (ts: {ts})"
+        return f"Reply posted to #{channel_name} (ts: {ts})"
     except SlackApiError as e:
         return f"Slack API error: {e.response['error']}"
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Add Slack Reaction",
+        readOnlyHint=False,
+        destructiveHint=False,
+        openWorldHint=True,
+    )
+)
+async def add_reaction(channel: str, message_ts: str, emoji: str) -> str:
+    """Add an emoji reaction to a Slack message.
+
+    Args:
+        channel: Channel name (e.g. '#superteam') or channel ID.
+        message_ts: Timestamp of the message to react to (from scan_channel output).
+        emoji: Emoji name without colons (e.g. 'bookmark', 'white_check_mark', 'eyes').
+    """
+    channel_id, channel_name = await _resolve_slack_channel(channel)
+    if channel_name is None:
+        return f"Could not resolve channel '{channel}'. Check the name or ID."
+
+    emoji_clean = emoji.strip(":")
+
+    client = _get_slack_bot_client()
+    try:
+        await client.reactions_add(
+            channel=channel_id,
+            timestamp=message_ts,
+            name=emoji_clean,
+        )
+        return f"Added :{emoji_clean}: to message in #{channel_name} (as Nuncius)"
+    except SlackApiError as e:
+        return f"Slack API error: {e.response['error']}"
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Remove Slack Reaction",
+        readOnlyHint=False,
+        destructiveHint=True,
+        openWorldHint=True,
+    )
+)
+async def remove_reaction(channel: str, message_ts: str, emoji: str) -> str:
+    """Remove an emoji reaction from a Slack message.
+
+    Args:
+        channel: Channel name (e.g. '#superteam') or channel ID.
+        message_ts: Timestamp of the message to remove the reaction from.
+        emoji: Emoji name without colons (e.g. 'bookmark', 'white_check_mark', 'eyes').
+    """
+    channel_id, channel_name = await _resolve_slack_channel(channel)
+    if channel_name is None:
+        return f"Could not resolve channel '{channel}'. Check the name or ID."
+
+    emoji_clean = emoji.strip(":")
+
+    client = _get_slack_bot_client()
+    try:
+        await client.reactions_remove(
+            channel=channel_id,
+            timestamp=message_ts,
+            name=emoji_clean,
+        )
+        return f"Removed :{emoji_clean}: from message in #{channel_name} (as Nuncius)"
+    except SlackApiError as e:
+        return f"Slack API error: {e.response['error']}"
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Scan Slack Channel",
+        readOnlyHint=True,
+        destructiveHint=False,
+        openWorldHint=True,
+    )
+)
+async def scan_channel(channel: str, hours_back: float = 24, limit: int = 200, emoji: str = "") -> str:
+    """Scan recent messages in a Slack channel.
+
+    Fetches messages going back approximately `hours_back` hours. Paginates
+    automatically, stopping when messages are older than the cutoff or `limit`
+    is reached.
+
+    Args:
+        channel: Channel name (e.g. '#product') or channel ID.
+        hours_back: How many hours back to scan (default 24).
+        limit: Maximum number of messages to return (default 200).
+        emoji: If set, only return messages that have this reaction (e.g. 'robot_face', 'eyes').
+    """
+    channel_id, channel_name = await _resolve_slack_channel(channel)
+    if channel_name is None:
+        return f"Could not resolve channel '{channel}'. Check the name or ID."
+
+    client = _get_slack_client()
+    cutoff = time.time() - (hours_back * 3600)
+
+    user_cache: dict[str, str] = {}
+
+    async def resolve_user(uid: str) -> str:
+        if uid in user_cache:
+            return user_cache[uid]
+        try:
+            u = await client.users_info(user=uid)
+            name = u["user"].get("real_name") or u["user"].get("name") or uid
+        except Exception:
+            name = uid
+        user_cache[uid] = name
+        return name
+
+    collected = []
+    cursor = None
+    hit_cutoff = False
+
+    try:
+        while len(collected) < limit and not hit_cutoff:
+            kwargs: dict = {"channel": channel_id, "limit": min(100, limit - len(collected))}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = await client.conversations_history(**kwargs)
+            messages = resp.get("messages", [])
+            if not messages:
+                break
+
+            for msg in messages:
+                ts = float(msg.get("ts", 0))
+                if ts < cutoff:
+                    hit_cutoff = True
+                    break
+
+                # Filter by emoji if requested
+                if emoji:
+                    reactions = msg.get("reactions", [])
+                    emoji_clean = emoji.strip(":")
+                    if not any(r.get("name") == emoji_clean for r in reactions):
+                        continue
+
+                user = await resolve_user(msg.get("user", "unknown"))
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
+                time_str = dt.strftime("%Y-%m-%d %H:%M")
+                text = msg.get("text", "")
+                reply_count = msg.get("reply_count", 0)
+                thread_ts = msg.get("thread_ts", "")
+
+                line = f"[{time_str}] {user}: {text}"
+                if reply_count > 0:
+                    line += f"\n  [{reply_count} replies, thread_ts: {thread_ts}]"
+                collected.append(line)
+
+                if len(collected) >= limit:
+                    break
+
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+    except SlackApiError as e:
+        return f"Slack API error: {e.response['error']}"
+
+    emoji_suffix = f" with :{emoji.strip(':')}:" if emoji else ""
+    if not collected:
+        return f"No messages{emoji_suffix} in #{channel_name} in the last {hours_back}h."
+
+    header = f"#{channel_name} — {len(collected)} messages{emoji_suffix} (last {hours_back}h)"
+    return header + "\n\n" + "\n\n".join(collected)
 
 
 @mcp.tool(
