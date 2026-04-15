@@ -28,6 +28,39 @@ from mcp.types import ToolAnnotations
 load_dotenv()
 
 logger = logging.getLogger("egregore-mcp")
+
+
+def _format_files(msg: dict) -> str:
+    """Extract file attachment info from a Slack message.
+
+    Returns a string describing each file (name, type, permalink),
+    or empty string if no files are present.
+    """
+    files = msg.get("files", [])
+    if not files:
+        return ""
+    parts = []
+    for f in files:
+        name = f.get("name") or f.get("title") or "unnamed"
+        mimetype = f.get("mimetype", "")
+        permalink = f.get("permalink", "")
+        mode = f.get("mode", "")
+        # Classify the attachment
+        if mimetype.startswith("image/"):
+            kind = "image"
+        elif mimetype.startswith("video/"):
+            kind = "video"
+        elif mimetype.startswith("audio/"):
+            kind = "audio"
+        elif mimetype == "application/pdf":
+            kind = "pdf"
+        else:
+            kind = f.get("filetype") or "file"
+        line = f"  [{kind}] {name}"
+        if permalink:
+            line += f" — {permalink}"
+        parts.append(line)
+    return "\n".join(parts)
 logger.setLevel(logging.DEBUG)
 # Log to stderr, NOT stdout (stdout is MCP protocol)
 handler = logging.StreamHandler()
@@ -889,10 +922,12 @@ async def check_slack_tags() -> str:
                 preview = msg.get("text", "")[:200]
                 reply_count = msg.get("reply_count", 0)
                 user = msg.get("user", "unknown")
+                files_str = _format_files(msg)
             else:
                 preview = "(could not fetch message)"
                 reply_count = 0
                 user = "unknown"
+                files_str = ""
 
             # Try to resolve channel name
             try:
@@ -901,7 +936,7 @@ async def check_slack_tags() -> str:
             except Exception:
                 ch_name = channel
 
-            results.append(
+            entry = (
                 f"- channel: {ch_name} ({channel})\n"
                 f"  thread_ts: {thread_ts}\n"
                 f"  tagged_at: {tagged_at}\n"
@@ -909,6 +944,9 @@ async def check_slack_tags() -> str:
                 f"  preview: {preview}\n"
                 f"  replies: {reply_count}"
             )
+            if files_str:
+                entry += f"\n{files_str}"
+            results.append(entry)
         except SlackApiError as e:
             results.append(f"- channel: {channel}, thread_ts: {thread_ts} — error: {e.response['error']}")
 
@@ -964,7 +1002,11 @@ async def read_slack_thread(channel: str, thread_ts: str) -> str:
             dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
             time_str = dt.strftime("%Y-%m-%d %H:%M")
             text = msg.get("text", "")
-            formatted.append(f"[{time_str}] {user}: {text}")
+            line = f"[{time_str}] {user}: {text}"
+            files_str = _format_files(msg)
+            if files_str:
+                line += f"\n{files_str}"
+            formatted.append(line)
 
         return "\n\n".join(formatted)
     except SlackApiError as e:
@@ -1198,6 +1240,9 @@ async def scan_channel(channel: str, hours_back: float = 24, limit: int = 200, e
                 thread_ts = msg.get("thread_ts", "")
 
                 line = f"[{time_str}] {user}: {text}"
+                files_str = _format_files(msg)
+                if files_str:
+                    line += f"\n{files_str}"
                 if reply_count > 0:
                     line += f"\n  [{reply_count} replies, thread_ts: {thread_ts}]"
                 collected.append(line)
@@ -1255,7 +1300,11 @@ async def search_slack(query: str, count: int = 10) -> str:
             time_str = dt.strftime("%Y-%m-%d %H:%M")
             text = m.get("text", "")[:200]
             permalink = m.get("permalink", "")
-            results.append(f"- [{time_str}] #{channel_name} | {user}: {text}\n  {permalink}")
+            line = f"- [{time_str}] #{channel_name} | {user}: {text}\n  {permalink}"
+            files_str = _format_files(m)
+            if files_str:
+                line += f"\n{files_str}"
+            results.append(line)
 
         header = f"Found {total} results (showing {len(matches)}):\n"
         return header + "\n".join(results)
